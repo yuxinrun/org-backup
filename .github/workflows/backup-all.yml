@@ -1,0 +1,165 @@
+name: backup-all
+
+on:
+  schedule:
+    # 每天 UTC 02:00（北京时间 10:00）
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: backup-all
+  cancel-in-progress: false
+
+env:
+  ORG: yuxinrun
+  OWNER: yuxink
+  # 镜像仓库可见性：private 或 public（只影响新建的镜像，不改动已有仓库）
+  MIRROR_VISIBILITY: private
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - name: Preflight
+        env:
+          ORG_READ_PAT: ${{ secrets.ORG_READ_PAT }}
+          PERSONAL_PAT: ${{ secrets.PERSONAL_PAT }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${ORG_READ_PAT:-}" ] || [ -z "${PERSONAL_PAT:-}" ]; then
+            echo "缺少 Secret：ORG_READ_PAT 和 PERSONAL_PAT 都必须配置"
+            exit 1
+          fi
+
+          login=$(GH_TOKEN="$PERSONAL_PAT" gh api user --jq .login)
+          echo "PERSONAL_PAT 所属账号：$login"
+          if [ "$login" != "$OWNER" ]; then
+            echo "PERSONAL_PAT 必须属于 $OWNER，实际为 $login"
+            exit 1
+          fi
+
+          GH_TOKEN="$ORG_READ_PAT" gh api "orgs/$ORG" --jq '"组织：\(.login)，公开仓库数：\(.public_repos)"'
+
+      - name: Mirror all public repos
+        env:
+          ORG_READ_PAT: ${{ secrets.ORG_READ_PAT }}
+          PERSONAL_PAT: ${{ secrets.PERSONAL_PAT }}
+        run: |
+          set -uo pipefail
+          export GIT_TERMINAL_PROMPT=0
+
+          auth_header() {
+            printf 'AUTHORIZATION: basic %s' "$(printf 'x-access-token:%s' "$1" | base64 -w0)"
+          }
+
+          workdir="$RUNNER_TEMP/mirrors"
+          mkdir -p "$workdir"
+
+          listing="$RUNNER_TEMP/repos.tsv"
+          if ! GH_TOKEN="$ORG_READ_PAT" gh api --paginate \
+                "orgs/$ORG/repos?type=public&per_page=100" \
+                --jq '.[] | select(.private == false) | [.name, .default_branch] | @tsv' > "$listing"; then
+            echo "拉取 $ORG 的仓库列表失败"
+            exit 1
+          fi
+
+          mapfile -t repos < "$listing"
+          echo "发现 ${#repos[@]} 个公开仓库"
+
+          {
+            echo "## $ORG -> $OWNER 镜像备份"
+            echo ""
+            echo "| 源仓库 | 结果 | 说明 |"
+            echo "| --- | --- | --- |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          sync_one() {
+            local name="$1" default_branch="$2"
+            local gitdir="$workdir/$name.git"
+            local target="https://github.com/$OWNER/$name.git"
+            local mirror_default="" created="" header=""
+
+            rm -rf "$gitdir"
+
+            if mirror_default=$(GH_TOKEN="$PERSONAL_PAT" gh repo view "$OWNER/$name" \
+                  --json defaultBranchRef --jq '.defaultBranchRef.name // ""' 2>/dev/null); then
+              echo "镜像仓库已存在，执行镜像同步"
+            else
+              echo "镜像仓库不存在，创建 $OWNER/$name（$MIRROR_VISIBILITY）"
+              GH_TOKEN="$PERSONAL_PAT" gh repo create "$OWNER/$name" "--$MIRROR_VISIBILITY" \
+                --description "Mirror backup of $ORG/$name" > /dev/null || return 1
+              # 避免镜像里的 push 工作流被同步推送触发，消耗 Actions 额度
+              GH_TOKEN="$PERSONAL_PAT" gh api -X PUT "repos/$OWNER/$name/actions/permissions" \
+                -F enabled=false > /dev/null || echo "警告：无法关闭 $OWNER/$name 的 Actions"
+              created="新建镜像"
+              mirror_default=""
+            fi
+
+            git -c "http.extraheader=$(auth_header "$ORG_READ_PAT")" clone --mirror \
+              "https://github.com/$ORG/$name.git" "$gitdir" || return 2
+
+            if [ -z "$(git -C "$gitdir" for-each-ref --format='%(refname)' --count=1)" ]; then
+              echo "源仓库为空，无需推送"
+              NOTE="空仓库"
+              return 0
+            fi
+
+            # GitHub 不允许写入 refs/pull/*，镜像克隆后先在本地移除
+            local ref
+            while IFS= read -r ref; do
+              [ -n "$ref" ] && git -C "$gitdir" update-ref -d "$ref"
+            done < <(git -C "$gitdir" for-each-ref --format='%(refname)' refs/pull)
+
+            header=$(auth_header "$PERSONAL_PAT")
+            if ! git -C "$gitdir" -c "http.extraheader=$header" push --mirror --quiet "$target"; then
+              # 源仓库改过默认分支时，旧默认分支不能被 --mirror 删除；先对齐再重试
+              if [ -n "$default_branch" ]; then
+                GH_TOKEN="$PERSONAL_PAT" gh api -X PATCH "repos/$OWNER/$name" \
+                  -f "default_branch=$default_branch" > /dev/null 2>&1 || true
+              fi
+              git -C "$gitdir" -c "http.extraheader=$header" push --mirror --quiet "$target" || return 3
+            fi
+
+            if [ -n "$default_branch" ] && [ "$mirror_default" != "$default_branch" ]; then
+              GH_TOKEN="$PERSONAL_PAT" gh api -X PATCH "repos/$OWNER/$name" \
+                -f "default_branch=$default_branch" > /dev/null || return 4
+            fi
+
+            NOTE="${created:-已同步}"
+            return 0
+          }
+
+          ok=0
+          fail=0
+          NOTE=""
+          for entry in "${repos[@]}"; do
+            [ -z "$entry" ] && continue
+            name="${entry%%$'\t'*}"
+            default_branch="${entry#*$'\t'}"
+
+            echo "::group::sync $ORG/$name"
+            if sync_one "$name" "$default_branch"; then
+              ok=$((ok + 1))
+              echo "| $ORG/$name | 成功 | ${NOTE} |" >> "$GITHUB_STEP_SUMMARY"
+            else
+              rc=$?
+              fail=$((fail + 1))
+              echo "| $ORG/$name | 失败 | exit=$rc |" >> "$GITHUB_STEP_SUMMARY"
+            fi
+            echo "::endgroup::"
+          done
+
+          {
+            echo ""
+            echo "成功 **$ok** 个，失败 **$fail** 个。"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$fail" -gt 0 ]; then
+            echo "有 $fail 个仓库同步失败，详见日志"
+            exit 1
+          fi
