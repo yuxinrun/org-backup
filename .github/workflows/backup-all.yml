@@ -31,19 +31,43 @@ jobs:
         run: |
           set -euo pipefail
 
-          if [ -z "${ORG_READ_PAT:-}" ] || [ -z "${PERSONAL_PAT:-}" ]; then
-            echo "缺少 Secret：ORG_READ_PAT 和 PERSONAL_PAT 都必须配置"
+          for name in ORG_READ_PAT PERSONAL_PAT; do
+            raw="${!name:-}"
+            value=$(printf '%s' "$raw" | tr -d '[:space:]')
+            if [ "$value" != "$raw" ]; then
+              echo "::warning::$name 含空格或换行，已自动去除；建议删除该 Secret 后重新粘贴"
+            fi
+            if [ -z "$value" ]; then
+              echo "::error::$name 未配置或为空"
+              exit 1
+            fi
+            case "$value" in
+              ghp_*|github_pat_*) ;;
+              *) echo "::warning::$name 不是以 ghp_ 或 github_pat_ 开头，请确认粘贴的是 PAT 本体" ;;
+            esac
+            printf -v "$name" '%s' "$value"
+          done
+
+          errfile=$(mktemp)
+
+          if ! login=$(GH_TOKEN="$PERSONAL_PAT" gh api user --jq .login 2> "$errfile"); then
+            echo "::error::PERSONAL_PAT 认证失败：$(tr -d '\r\n' < "$errfile")"
+            echo "Bad credentials 表示 token 本身无效：请确认复制完整、未过期、未被撤销，并删除 Secret 后重新粘贴。"
             exit 1
           fi
-
-          login=$(GH_TOKEN="$PERSONAL_PAT" gh api user --jq .login)
           echo "PERSONAL_PAT 所属账号：$login"
           if [ "$login" != "$OWNER" ]; then
-            echo "PERSONAL_PAT 必须属于 $OWNER，实际为 $login"
+            echo "::error::PERSONAL_PAT 必须属于 $OWNER，实际为 $login"
             exit 1
           fi
 
-          GH_TOKEN="$ORG_READ_PAT" gh api "orgs/$ORG" --jq '"组织：\(.login)，公开仓库数：\(.public_repos)"'
+          if ! org_info=$(GH_TOKEN="$ORG_READ_PAT" gh api "orgs/$ORG" \
+                --jq '"\(.login)（公开仓库 \(.public_repos) 个）"' 2> "$errfile"); then
+            echo "::error::ORG_READ_PAT 无法读取组织 $ORG：$(tr -d '\r\n' < "$errfile")"
+            echo "常见原因：token 无效或过期、组织 SSO 未授权、组织限制了 token 访问。"
+            exit 1
+          fi
+          echo "组织：$org_info"
 
       - name: Mirror all public repos
         env:

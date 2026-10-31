@@ -52,6 +52,16 @@ README.md
 
 > 建议给两个 PAT 都设置有效期（如 90 天），到期前轮换并更新 Secret；过期后备份任务会直接失败。
 
+生成后先在本地验证 token 是否有效（不要把 token 发到聊天或提交到仓库）：
+
+```bash
+read -rsp "PAT: " PAT; echo
+curl -s -o /dev/null -w "%{http_code}\n" -H "Authorization: Bearer $PAT" https://api.github.com/user
+unset PAT
+```
+
+返回 `200` 表示 token 有效；`401` 表示 token 本身无效（复制不完整、已过期或已撤销），需要重新生成。
+
 ### 2. 配置 Secrets
 
 进入 `yuxinrun/org-backup` → **Settings** → **Secrets and variables** → **Actions** → **New repository secret**，添加：
@@ -156,6 +166,7 @@ README.md
 
 | 现象 | 常见原因 |
 | --- | --- |
+| Preflight 报 `Bad credentials (HTTP 401)` | 对应 Secret 的 token 本身无效：复制不完整、已过期或已撤销、粘贴时带了空格/换行。删除该 Secret 后重新粘贴；本地用上面的 curl 命令验证 |
 | Preflight 报 `PERSONAL_PAT 必须属于 yuxink` | Secret 填错，或用了其他账号的 token |
 | `gh api orgs/yuxinrun` 返回 401/403 | `ORG_READ_PAT` 无效、过期，或组织 SSO 未授权 |
 | 建仓失败 403 | `PERSONAL_PAT` 缺少 `repo` 权限，或 fine-grained token 不支持建仓 |
